@@ -1288,8 +1288,19 @@ class SVCFly:
         render_dir = osp.join(WORK_DIR, render_name)
         os.makedirs(render_dir, exist_ok=True)
         
-        # Convert from ComfyUI format (BCHW) to the format needed by the renderer (BHWC)
-        input_imgs = rearrange(images, "b c h w -> b h w c")
+        # Check input format and convert if needed
+        print(f"Input image tensor shape: {images.shape}")
+        
+        # Detect if images are already in BHWC format (common with external tools)
+        if len(images.shape) == 4 and images.shape[3] == 3 and images.shape[1] > 16 and images.shape[2] > 16:
+            print("Images already in BHWC format, no need to rearrange")
+            input_imgs = images  # Already in BHWC format
+        else:
+            # Convert from ComfyUI format (BCHW) to the format needed by the renderer (BHWC)
+            print("Converting from BCHW to BHWC format")
+            input_imgs = rearrange(images, "b c h w -> b h w c")
+        
+        print(f"Processed image shape for rendering: {input_imgs.shape}")
         
         # Save images to disk temporarily (DUST3R needs file paths)
         img_paths = []
