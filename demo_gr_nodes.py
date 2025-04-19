@@ -1338,37 +1338,34 @@ class SVCFly:
             print(f"DUST3R camera extraction failed: {e}")
             print("Using manual camera parameter setup instead...")
             
-            # Create a simple camera setup that places cameras in a circular pattern
-            # Always using ALL input images as keyframes (as requested)
+            # Create a simple camera setup with cameras looking at the center
             input_Ks = []
             input_c2ws = []
             
             # Create default camera intrinsics based on aspect ratio
             K = get_default_intrinsics(aspect_ratio=W/H)[0].numpy()
             
+            # Position cameras in a simple arc
             for i in range(num_inputs):
-                # Position cameras in a semicircle
-                angle = i * (np.pi / (num_inputs - 1 or 1))
+                # Create camera-to-world matrix (place cameras around an arc)
+                angle = i * (np.pi / 4)  # Spread cameras around 45 degrees per camera
                 
-                # Create camera-to-world matrix with rotation
+                # Create camera-to-world matrix - make it look at origin
                 c2w = np.eye(4)
-                
-                # Place cameras in a slight arc, all looking at center
                 radius = 3.0
                 c2w[0, 3] = radius * np.sin(angle)  # X position
-                c2w[2, 3] = radius * np.cos(angle)  # Z position
+                c2w[2, 3] = radius * np.cos(angle)  # Z position (depth)
+                c2w[1, 3] = 0.5  # Slight elevation
                 
-                # Make camera look at origin
-                forward = -c2w[:3, 3] / np.linalg.norm(c2w[:3, 3])
+                # Make camera look at origin (0,0,0)
+                position = c2w[:3, 3]
+                forward = -position / np.linalg.norm(position)
                 up = np.array([0.0, 1.0, 0.0])
                 right = np.cross(up, forward)
+                right = right / np.linalg.norm(right)
                 up = np.cross(forward, right)
                 
-                # Normalize vectors
-                right = right / np.linalg.norm(right)
-                up = up / np.linalg.norm(up)
-                
-                # Set rotation matrix (camera looks at center)
+                # Set rotation matrix
                 c2w[:3, 0] = right
                 c2w[:3, 1] = up
                 c2w[:3, 2] = forward
@@ -1380,7 +1377,7 @@ class SVCFly:
             input_c2ws = torch.tensor(np.stack(input_c2ws, axis=0), dtype=torch.float32)
             input_Ks = torch.tensor(np.stack(input_Ks, axis=0), dtype=torch.float32)
         
-        # Process images to ensure they're properly sized
+        # Process images to ensure proper size
         shorter = 576
         shorter = round(shorter / 64) * 64
         
@@ -1388,7 +1385,6 @@ class SVCFly:
         for img, K in zip(input_imgs, input_Ks):
             img_tensor = torch.as_tensor(img)
             img_tensor = rearrange(img_tensor, "h w c -> 1 c h w")
-            # Transform images to the appropriate size
             img_tensor, K_new = transform_img_and_K(img_tensor, shorter, K=K[None], size_stride=64)
             K_new = K_new / K_new.new_tensor([img_tensor.shape[-1], img_tensor.shape[-2], 1])[:, None]
             new_input_imgs.append(img_tensor)
@@ -1398,75 +1394,50 @@ class SVCFly:
         input_imgs = rearrange(input_imgs, "b c h w -> b h w c")[..., :3]
         input_Ks = torch.cat(new_input_Ks, 0)
         
-        # Always create interpolated path between ALL input images
-        # This is the key part to ensure advanced mode behavior
+        # ===== CRITICAL CHANGE: Match the exact img2trajvid flow from demo.py =====
+        # Generate target cameras from preset trajectories
+        # We use target_traj="circle" as default since we don't have external data
+        preset_traj = "orbit"  # Default trajectory
         
-        # Create output camera trajectories by interpolating between keyframes
-        target_c2ws = []
-        target_Ks = []
+        # Calculate the number of target frames based on num_frames parameter
+        num_targets = num_frames
         
-        # Create evenly spaced frames between keyframes
-        frames_per_segment = max(1, num_frames // (num_inputs - 1))
-        remaining_frames = num_frames - frames_per_segment * (num_inputs - 1)
+        # Generate target cameras using preset trajectory - use parameters consistent with the existing code
+        # Get starting camera parameters
+        start_c2w = input_c2ws[0]
+        start_w2c = torch.linalg.inv(start_c2w)
+        look_at = torch.tensor([0, 0, 10])  # Look 10 units ahead by default
         
-        for i in range(num_inputs - 1):
-            # Starting camera for this segment
-            start_c2w = input_c2ws[i]
-            start_K = input_Ks[i]
-            
-            # Ending camera for this segment
-            end_c2w = input_c2ws[i+1]
-            end_K = input_Ks[i+1]
-            
-            # Number of frames for this segment (add extra frames to first segments if needed)
-            seg_frames = frames_per_segment
-            if i < remaining_frames:
-                seg_frames += 1
-                
-            # Interpolate cameras for this segment
-            for j in range(seg_frames):
-                t = j / seg_frames
-                # Slerp rotation
-                R1 = start_c2w[:3, :3]
-                R2 = end_c2w[:3, :3]
-                
-                # Handle potential numerical instability in rotation interpolation
-                try:
-                    R = torch.as_tensor(torch.linalg.matmul(R1, torch.linalg.inv(R1).matmul(R2)) ** t).matmul(R1)
-                except Exception as e:
-                    print(f"Rotation interpolation failed: {e}, using simple lerp")
-                    R = (1 - t) * R1 + t * R2
-                    # Normalize to ensure it's a valid rotation matrix
-                    U, _, V = torch.linalg.svd(R)
-                    R = U @ V.T
-                
-                # Linear interpolation for translation
-                T = (1 - t) * start_c2w[:3, 3] + t * end_c2w[:3, 3]
-                
-                # Combine into camera matrix
-                c2w = torch.eye(4)
-                c2w[:3, :3] = R
-                c2w[:3, 3] = T
-                
-                # Linear interpolation for intrinsics
-                K = (1 - t) * start_K + t * end_K
-                
-                target_c2ws.append(c2w)
-                target_Ks.append(K)
+        # Generate target cameras using preset trajectory with proper parameters
+        target_c2ws, target_fovs = get_preset_pose_fov(
+            preset_traj,
+            num_targets,
+            start_w2c,
+            look_at,
+            -start_c2w[:3, 1],  # Use camera's up vector
+            DEFAULT_FOV_RAD,
+            spiral_radii=[1.0, 1.0, 0.5],
+        )
         
-        # Convert to tensors
-        target_c2ws = torch.stack(target_c2ws)
-        target_Ks = torch.stack(target_Ks)
+        # Convert to torch tensors
+        target_c2ws = torch.as_tensor(target_c2ws)
         
-        # Setup rendering parameters
+        # Get target intrinsics based on fov
+        target_Ks = get_default_intrinsics(
+            torch.as_tensor(target_fovs),
+            aspect_ratio=W/H,
+        )
+        
+        # Create full camera trajectory by concatenating input and target cameras
         all_c2ws = torch.cat([input_c2ws, target_c2ws], 0)
         all_Ks = torch.cat([input_Ks, target_Ks], 0) * input_Ks.new_tensor([W, H, 1])[:, None]
         
-        num_targets = len(target_c2ws)
+        # Define indices for input and target frames
         input_indices = list(range(num_inputs))
-        target_indices = np.arange(num_inputs, num_inputs + num_targets).tolist()
+        target_indices = list(range(num_inputs, num_inputs + num_targets))
         
-        # Calculate number of anchor frames
+        # Calculate number of anchor frames needed
+        # THIS IS THE EXACT PATTERN FROM demo.py LINE 231-240
         T = VERSION_DICT["T"]
         version_dict = copy.deepcopy(VERSION_DICT)
         num_anchors = infer_prior_stats(
@@ -1480,14 +1451,23 @@ class SVCFly:
         T = version_dict["T"]
         assert isinstance(num_anchors, int)
         
-        # Get anchor indices and cameras (sample evenly from target frames)
+        # EXACT ANCHOR SAMPLING FROM demo.py:
+        # 1. Get target cameras
+        target_c2ws_anchors = target_c2ws
+        target_Ks_anchors = target_Ks
+        
+        # 2. Sample anchor cameras evenly from target cameras
+        # This is the key part matching demo.py line 236-240
+        anchor_indices_in_targets = np.linspace(0, num_targets - 1, num_anchors).round().astype(np.int64)
+        anchor_c2ws = target_c2ws_anchors[anchor_indices_in_targets]
+        anchor_Ks = target_Ks_anchors[anchor_indices_in_targets]
+        
+        # 3. Calculate the actual anchor indices in the combined sequence
         anchor_indices = np.linspace(
             num_inputs,
             num_inputs + num_targets - 1,
-            num_anchors,
+            num_anchors
         ).tolist()
-        anchor_c2ws = all_c2ws[[round(ind) for ind in anchor_indices]]
-        anchor_Ks = all_Ks[[round(ind) for ind in anchor_indices]]
         
         # Create image conditioning
         all_imgs_np = (
