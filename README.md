@@ -1,3 +1,11 @@
+
+
+
+
+
+
+
+
 <div align="center">
 <h1>Stable Virtual Camera: Generative View Synthesis with Diffusion Models</h1>
 
