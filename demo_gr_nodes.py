@@ -1589,6 +1589,8 @@ class SVCFly:
             # If no frames were generated, return the input
             return (images, video_path or "")
         
+        print(f"Found {len(frame_files)} frames in {frames_path}")
+
         # Load frames and convert to tensor in ComfyUI format (BCHW)
         frames = []
         for frame_path in frame_files:
@@ -1632,13 +1634,135 @@ class SVCFly:
         )
         return target_c2ws, target_Ks
 
+class SVCFly_Bash:
+    """ComfyUI node for Stable Virtual Camera Flythrough generation using the bash script."""
+    
+    def __init__(self):
+        # Create an abort event for rendering control
+        self.abort_event = threading.Event()
+        
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE",),
+                "seed": ("INT", {"default": 23, "min": 0, "max": 0xffffffffffffffff}),
+                "cfg": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 5.0, "step": 0.1}),
+                "camera_scale": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1}),
+                "num_frames": ("INT", {"default": 30, "min": 5, "max": 120, "step": 1}),
+            },
+            "optional": {
+                "chunk_strategy": (["interp-gt", "interp"], {"default": "interp-gt"}),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE", "STRING")
+    RETURN_NAMES = ("video_frames", "video_path")
+    FUNCTION = "generate_fly"
+    CATEGORY = "StableVirtualCamera"
+
+    def generate_fly(self, images, seed, cfg, camera_scale, num_frames, chunk_strategy="interp-gt"):
+        import os
+        import tempfile
+        import subprocess
+        import shutil
+        from glob import glob
+        import imageio.v3 as iio
+        import torch
+        from einops import rearrange
+
+        # Convert from ComfyUI format (BCHW) to HWC format for saving
+        if len(images.shape) == 4 and images.shape[1] == 3 and images.shape[0] >= 1:
+            # Input is in BCHW format, convert to BHWC first
+            print(f"Converting input tensor of shape {images.shape} from BCHW to BHWC")
+            images_to_save = rearrange(images, "b c h w -> b h w c").cpu().numpy()
+        else:
+            # Assume already in BHWC format
+            images_to_save = images.cpu().numpy()
+        
+        # Create a timestamp-based name for unique folders
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        
+        # Create a temporary directory to hold the input images
+        temp_dir = os.path.join(WORK_DIR, f"input_{timestamp}")
+        os.makedirs(temp_dir, exist_ok=True)
+        
+        print(f"Saving {len(images_to_save)} images to {temp_dir}")
+        
+        # Save each image to the temp directory
+        for i, img in enumerate(images_to_save):
+            # Convert from [0,1] float to [0,255] uint8
+            img_np = (img * 255).astype(np.uint8)
+            img_path = os.path.join(temp_dir, f"{i:03d}.png")
+            iio.imwrite(img_path, img_np)
+        
+        # Define output directory
+        output_dir = os.path.join(WORK_DIR, f"output_{timestamp}")
+        
+        # Create the command to run demo.py
+        cmd = [
+            "python", "demo.py",
+            "--data_path", temp_dir,
+            "--task", "img2trajvid",
+            "--cfg", f"{cfg},2.0",  # First value is for view synthesis, second is for test-time conditioning
+            "--camera_scale", str(camera_scale),
+            "--use_traj_prior", "True",
+            "--chunk_strategy", chunk_strategy,
+            "--seed", str(seed),
+            "--num_targets", str(num_frames),
+            "--save_subdir", f"output_{timestamp}"
+        ]
+        
+        print(f"Running command: {' '.join(cmd)}")
+        
+        try:
+            # Run the command
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print(f"Command output: {result.stdout}")
+            
+            # Find the output directory - it should be in WORK_DIR/img2trajvid/output_{timestamp}
+            results_dir = os.path.join(WORK_DIR, "img2trajvid", f"output_{timestamp}")
+            
+            # Find the video file
+            video_files = glob(os.path.join(results_dir, "*.mp4"))
+            video_path = video_files[0] if video_files else ""
+            
+            if not video_path:
+                print("No video was generated.")
+                return (images, "")
+            
+            print(f"Generated video: {video_path}")
+            
+            # Instead of loading all frames, which can be memory-intensive,
+            # just return the input images and the video path
+            # ComfyUI will display the video using the path
+            
+            # Clean up temporary input directory
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            
+            return (images, video_path)
+            
+        except subprocess.CalledProcessError as e:
+            print(f"Error running demo.py: {e}")
+            print(f"STDERR: {e.stderr}")
+            # Clean up
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return (images, "")
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            # Clean up
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return (images, "")
+
 # Register the node class for ComfyUI
 NODE_CLASS_MAPPINGS = {
-    "SVCFly": SVCFly
+    "SVCFly": SVCFly,
+    "SVCFly_Bash": SVCFly_Bash
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "SVCFly": "SVC Flythrough Generator"
+    "SVCFly": "SVC Flythrough Generator",
+    "SVCFly_Bash": "SVC Flythrough Generator (Bash)"
 }
 
 if __name__ == "__main__":
