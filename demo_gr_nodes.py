@@ -1583,7 +1583,7 @@ class SVCFly:
                 
         # Load the generated frames for return
         frames_path = os.path.join(render_dir, "samples-rgb")
-        frame_files = sorted(glob.glob(os.path.join(frames_path, "*.png")))
+        frame_files = sorted(glob(os.path.join(frames_path, "*.png")))
         
         if len(frame_files) == 0:
             # If no frames were generated, return the input
