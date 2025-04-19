@@ -10,6 +10,7 @@ from datetime import datetime
 from glob import glob
 from pathlib import Path
 from typing import Literal
+import subprocess
 
 import gradio as gr
 import httpx
@@ -24,6 +25,7 @@ from einops import rearrange
 from gradio import networking
 from gradio.context import LocalContext
 from gradio.tunneling import CERTIFICATE_PATH, Tunnel
+import shutil
 
 from seva.eval import (
     IS_TORCH_NIGHTLY,
@@ -1662,14 +1664,6 @@ class SVCFly_Bash:
     CATEGORY = "StableVirtualCamera"
 
     def generate_fly(self, images, seed, cfg, camera_scale, num_frames, chunk_strategy="interp-gt"):
-        import os
-        import tempfile
-        import subprocess
-        import shutil
-        from glob import glob
-        import imageio.v3 as iio
-        import torch
-        from einops import rearrange
 
         # Convert from ComfyUI format (BCHW) to HWC format for saving
         if len(images.shape) == 4 and images.shape[1] == 3 and images.shape[0] >= 1:
