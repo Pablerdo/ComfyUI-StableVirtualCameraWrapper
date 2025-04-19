@@ -1265,12 +1265,7 @@ class SVCFly:
                 "seed": ("INT", {"default": 23, "min": 0, "max": 0xffffffffffffffff}),
                 "cfg": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 5.0, "step": 0.1}),
                 "camera_scale": ("FLOAT", {"default": 2.0, "min": 0.1, "max": 10.0, "step": 0.1}),
-                "preset_traj": (["orbit", "spiral", "lemniscate", "zoom-in", "zoom-out", 
-                                "dolly zoom-in", "dolly zoom-out", "move-forward", 
-                                "move-backward", "move-up", "move-down", "move-left", 
-                                "move-right"], {"default": "orbit"}),
                 "num_frames": ("INT", {"default": 30, "min": 5, "max": 120, "step": 1}),
-                "zoom_factor": ("FLOAT", {"default": 1.5, "min": 0.5, "max": 5.0, "step": 0.1}),
             },
             "optional": {
                 "chunk_strategy": (["nearest", "nearest-gt"], {"default": "nearest"}),
@@ -1282,7 +1277,7 @@ class SVCFly:
     FUNCTION = "generate_fly"
     CATEGORY = "StableVirtualCamera"
     
-    def generate_fly(self, images, seed, cfg, camera_scale, preset_traj, num_frames, zoom_factor, chunk_strategy="nearest"):
+    def generate_fly(self, images, seed, cfg, camera_scale, num_frames, chunk_strategy="nearest"):
         # Create a session hash for this specific render
         session_hash = f"comfyui_{int(time.time())}"
         ABORT_EVENTS[session_hash] = self.abort_event
@@ -1293,44 +1288,131 @@ class SVCFly:
         render_dir = osp.join(WORK_DIR, render_name)
         os.makedirs(render_dir, exist_ok=True)
         
-        # Process input images
         # Convert from ComfyUI format (BCHW) to the format needed by the renderer (BHWC)
         input_imgs = rearrange(images, "b c h w -> b h w c")
         
-        # Use first image for parameters
+        # Save images to disk temporarily (DUST3R needs file paths)
+        img_paths = []
+        for i, img in enumerate(input_imgs):
+            # Convert from [0,1] float to [0,255] uint8
+            img_np = (img.cpu().numpy() * 255).astype(np.uint8)
+            img_path = os.path.join(render_dir, f"input_{i:03d}.png")
+            iio.imwrite(img_path, img_np)
+            img_paths.append(img_path)
+        
+        # Use DUST3R to extract camera poses from all input images
+        (
+            dust3r_imgs,
+            dust3r_Ks,
+            dust3r_c2ws,
+            points,
+            point_colors,
+        ) = DUST3R.infer_cameras_and_points(img_paths)
+        
+        # Use images from the input rather than DUST3R's processed images
+        # but keep DUST3R's camera parameters
+        num_inputs = len(input_imgs)
+        
+        # Normalize the scene
+        point_chunks = [p.shape[0] for p in points]
+        point_indices = np.cumsum(point_chunks)[:-1]
+        dust3r_c2ws, points, _ = normalize_scene(
+            dust3r_c2ws,
+            np.concatenate(points, 0),
+            camera_center_method="poses",
+        )
+        points = np.split(points, point_indices, 0)
+        
+        # Scale camera and points for visualization
+        scene_scale = np.median(
+            np.ptp(np.concatenate([dust3r_c2ws[:, :3, 3], *points], 0), -1)
+        )
+        dust3r_c2ws[:, :3, 3] /= scene_scale
+        points = [point / scene_scale for point in points]
+        
+        # Process input images and convert to torch tensors
+        # Also normalize camera intrinsics
+        input_Ks = torch.as_tensor(dust3r_Ks)
+        input_c2ws = torch.as_tensor(dust3r_c2ws)
+        
+        # Use first image for output dimensions
         H, W = input_imgs.shape[1:3]
         
-        # Setup default camera intrinsics
-        input_Ks = get_default_intrinsics(
-            aspect_ratio=W/H
-        )
+        new_input_imgs, new_input_Ks = [], []
+        for img, K in zip(input_imgs, input_Ks):
+            img_tensor = torch.as_tensor(img)
+            img_tensor = rearrange(img_tensor, "h w c -> 1 c h w")
+            # Transform images to the appropriate size
+            img_tensor, K_new = transform_img_and_K(img_tensor, 576, K=K[None], size_stride=64)
+            K_new = K_new / K_new.new_tensor([img_tensor.shape[-1], img_tensor.shape[-2], 1])[:, None]
+            new_input_imgs.append(img_tensor)
+            new_input_Ks.append(K_new)
         
-        # Setup default camera extrinsics (identity for the first frame)
-        input_c2ws = torch.eye(4)[None]
+        input_imgs = torch.cat(new_input_imgs, 0)
+        input_imgs = rearrange(input_imgs, "b c h w -> b h w c")[..., :3]
+        input_Ks = torch.cat(new_input_Ks, 0)
         
-        # Prepare the renderer inputs
-        preprocessed = {
-            "input_imgs": input_imgs,
-            "input_Ks": input_Ks,
-            "input_c2ws": input_c2ws,
-            "input_wh": (W, H),
-        }
+        # The current camera positions (from DUST3R) are our keyframes
+        # We will generate interpolated frames between these keyframes
         
-        # Get target cameras based on preset trajectory
-        target_c2ws, target_Ks = self.get_target_c2ws_and_Ks_from_preset(
-            preprocessed, preset_traj, num_frames, zoom_factor
-        )
+        # Create output camera trajectories by interpolating between keyframes
+        # First, create a list of target camera frames to interpolate to
+        target_c2ws = []
+        target_Ks = []
         
+        # Create evenly spaced frames between keyframes
+        frames_per_segment = max(1, num_frames // (num_inputs - 1))
+        remaining_frames = num_frames - frames_per_segment * (num_inputs - 1)
+        
+        for i in range(num_inputs - 1):
+            # Starting camera for this segment
+            start_c2w = input_c2ws[i]
+            start_K = input_Ks[i]
+            
+            # Ending camera for this segment
+            end_c2w = input_c2ws[i+1]
+            end_K = input_Ks[i+1]
+            
+            # Number of frames for this segment (add extra frames to first segments if needed)
+            seg_frames = frames_per_segment
+            if i < remaining_frames:
+                seg_frames += 1
+                
+            # Interpolate cameras for this segment
+            for j in range(seg_frames):
+                t = j / seg_frames
+                # Slerp rotation
+                R1 = start_c2w[:3, :3]
+                R2 = end_c2w[:3, :3]
+                R = torch.as_tensor(torch.linalg.matmul(R1, torch.linalg.inv(R1).matmul(R2)) ** t).matmul(R1)
+                
+                # Linear interpolation for translation
+                T = (1 - t) * start_c2w[:3, 3] + t * end_c2w[:3, 3]
+                
+                # Combine into camera matrix
+                c2w = torch.eye(4)
+                c2w[:3, :3] = R
+                c2w[:3, 3] = T
+                
+                # Linear interpolation for intrinsics
+                K = (1 - t) * start_K + t * end_K
+                
+                target_c2ws.append(c2w)
+                target_Ks.append(K)
+        
+        # Convert to tensors
+        target_c2ws = torch.stack(target_c2ws)
+        target_Ks = torch.stack(target_Ks)
+                
         # Setup rendering parameters
         all_c2ws = torch.cat([input_c2ws, target_c2ws], 0)
         all_Ks = torch.cat([input_Ks, target_Ks], 0) * input_Ks.new_tensor([W, H, 1])[:, None]
         
-        num_inputs = len(input_imgs)
         num_targets = len(target_c2ws)
         input_indices = list(range(num_inputs))
         target_indices = np.arange(num_inputs, num_inputs + num_targets).tolist()
         
-        # Get anchor cameras
+        # Calculate number of anchor frames
         T = VERSION_DICT["T"]
         version_dict = copy.deepcopy(VERSION_DICT)
         num_anchors = infer_prior_stats(
@@ -1343,6 +1425,8 @@ class SVCFly:
         # infer_prior_stats modifies T in-place
         T = version_dict["T"]
         assert isinstance(num_anchors, int)
+        
+        # Get anchor indices and cameras (sample evenly from target frames)
         anchor_indices = np.linspace(
             num_inputs,
             num_inputs + num_targets - 1,
@@ -1483,36 +1567,6 @@ class SVCFly:
         
         # Return both the frames and the video path
         return (output_frames, video_path or "")
-
-    def get_target_c2ws_and_Ks_from_preset(
-        self,
-        preprocessed: dict,
-        preset_traj: str,
-        num_frames: int,
-        zoom_factor: float,
-    ):
-        img_wh = preprocessed["input_wh"]
-        start_c2w = preprocessed["input_c2ws"][0]
-        start_w2c = torch.linalg.inv(start_c2w)
-        look_at = torch.tensor([0, 0, 10])
-        start_fov = DEFAULT_FOV_RAD
-        target_c2ws, target_fovs = get_preset_pose_fov(
-            preset_traj,
-            num_frames,
-            start_w2c,
-            look_at,
-            -start_c2w[:3, 1],
-            start_fov,
-            spiral_radii=[1.0, 1.0, 0.5],
-            zoom_factor=zoom_factor,
-        )
-        target_c2ws = torch.as_tensor(target_c2ws)
-        target_fovs = torch.as_tensor(target_fovs)
-        target_Ks = get_default_intrinsics(
-            target_fovs,
-            aspect_ratio=img_wh[0] / img_wh[1],
-        )
-        return target_c2ws, target_Ks
 
 # Register the node class for ComfyUI
 NODE_CLASS_MAPPINGS = {
