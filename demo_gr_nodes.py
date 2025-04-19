@@ -1302,7 +1302,11 @@ class SVCFly:
         
         print(f"Processed image shape for rendering: {input_imgs.shape}")
         
-        # Save images to disk temporarily (DUST3R needs file paths)
+        # Use first image dimensions for initialization
+        H, W = input_imgs.shape[1:3]
+        num_inputs = len(input_imgs)
+        
+        # Save images to disk temporarily (needed for processing)
         img_paths = []
         for i, img in enumerate(input_imgs):
             # Convert from [0,1] float to [0,255] uint8
@@ -1311,50 +1315,81 @@ class SVCFly:
             iio.imwrite(img_path, img_np)
             img_paths.append(img_path)
         
-        # Use DUST3R to extract camera poses from all input images
-        (
-            dust3r_imgs,
-            dust3r_Ks,
-            dust3r_c2ws,
-            points,
-            point_colors,
-        ) = DUST3R.infer_cameras_and_points(img_paths)
+        # Try to get camera parameters using DUST3R first
+        try:
+            print("Attempting to extract camera parameters with DUST3R...")
+            dust3r_imgs, dust3r_Ks, dust3r_c2ws, points, point_colors = DUST3R.infer_cameras_and_points(img_paths)
+            
+            # Normalize the scene
+            point_chunks = [p.shape[0] for p in points]
+            point_indices = np.cumsum(point_chunks)[:-1]
+            dust3r_c2ws, points, _ = normalize_scene(
+                dust3r_c2ws,
+                np.concatenate(points, 0),
+                camera_center_method="poses",
+            )
+            
+            # DUST3R succeeded, use its camera parameters
+            print("DUST3R camera extraction succeeded!")
+            input_Ks = torch.as_tensor(dust3r_Ks)
+            input_c2ws = torch.as_tensor(dust3r_c2ws)
+            
+        except Exception as e:
+            print(f"DUST3R camera extraction failed: {e}")
+            print("Using manual camera parameter setup instead...")
+            
+            # Create a simple camera setup that places cameras in a circular pattern
+            # Always using ALL input images as keyframes (as requested)
+            input_Ks = []
+            input_c2ws = []
+            
+            # Create default camera intrinsics based on aspect ratio
+            K = get_default_intrinsics(aspect_ratio=W/H)[0].numpy()
+            
+            for i in range(num_inputs):
+                # Position cameras in a semicircle
+                angle = i * (np.pi / (num_inputs - 1 or 1))
+                
+                # Create camera-to-world matrix with rotation
+                c2w = np.eye(4)
+                
+                # Place cameras in a slight arc, all looking at center
+                radius = 3.0
+                c2w[0, 3] = radius * np.sin(angle)  # X position
+                c2w[2, 3] = radius * np.cos(angle)  # Z position
+                
+                # Make camera look at origin
+                forward = -c2w[:3, 3] / np.linalg.norm(c2w[:3, 3])
+                up = np.array([0.0, 1.0, 0.0])
+                right = np.cross(up, forward)
+                up = np.cross(forward, right)
+                
+                # Normalize vectors
+                right = right / np.linalg.norm(right)
+                up = up / np.linalg.norm(up)
+                
+                # Set rotation matrix (camera looks at center)
+                c2w[:3, 0] = right
+                c2w[:3, 1] = up
+                c2w[:3, 2] = forward
+                
+                input_c2ws.append(c2w)
+                input_Ks.append(K)
+            
+            # Convert to torch tensors
+            input_c2ws = torch.tensor(np.stack(input_c2ws, axis=0), dtype=torch.float32)
+            input_Ks = torch.tensor(np.stack(input_Ks, axis=0), dtype=torch.float32)
         
-        # Use images from the input rather than DUST3R's processed images
-        # but keep DUST3R's camera parameters
-        num_inputs = len(input_imgs)
-        
-        # Normalize the scene
-        point_chunks = [p.shape[0] for p in points]
-        point_indices = np.cumsum(point_chunks)[:-1]
-        dust3r_c2ws, points, _ = normalize_scene(
-            dust3r_c2ws,
-            np.concatenate(points, 0),
-            camera_center_method="poses",
-        )
-        points = np.split(points, point_indices, 0)
-        
-        # Scale camera and points for visualization
-        scene_scale = np.median(
-            np.ptp(np.concatenate([dust3r_c2ws[:, :3, 3], *points], 0), -1)
-        )
-        dust3r_c2ws[:, :3, 3] /= scene_scale
-        points = [point / scene_scale for point in points]
-        
-        # Process input images and convert to torch tensors
-        # Also normalize camera intrinsics
-        input_Ks = torch.as_tensor(dust3r_Ks)
-        input_c2ws = torch.as_tensor(dust3r_c2ws)
-        
-        # Use first image for output dimensions
-        H, W = input_imgs.shape[1:3]
+        # Process images to ensure they're properly sized
+        shorter = 576
+        shorter = round(shorter / 64) * 64
         
         new_input_imgs, new_input_Ks = [], []
         for img, K in zip(input_imgs, input_Ks):
             img_tensor = torch.as_tensor(img)
             img_tensor = rearrange(img_tensor, "h w c -> 1 c h w")
             # Transform images to the appropriate size
-            img_tensor, K_new = transform_img_and_K(img_tensor, 576, K=K[None], size_stride=64)
+            img_tensor, K_new = transform_img_and_K(img_tensor, shorter, K=K[None], size_stride=64)
             K_new = K_new / K_new.new_tensor([img_tensor.shape[-1], img_tensor.shape[-2], 1])[:, None]
             new_input_imgs.append(img_tensor)
             new_input_Ks.append(K_new)
@@ -1363,11 +1398,10 @@ class SVCFly:
         input_imgs = rearrange(input_imgs, "b c h w -> b h w c")[..., :3]
         input_Ks = torch.cat(new_input_Ks, 0)
         
-        # The current camera positions (from DUST3R) are our keyframes
-        # We will generate interpolated frames between these keyframes
+        # Always create interpolated path between ALL input images
+        # This is the key part to ensure advanced mode behavior
         
         # Create output camera trajectories by interpolating between keyframes
-        # First, create a list of target camera frames to interpolate to
         target_c2ws = []
         target_Ks = []
         
@@ -1395,7 +1429,16 @@ class SVCFly:
                 # Slerp rotation
                 R1 = start_c2w[:3, :3]
                 R2 = end_c2w[:3, :3]
-                R = torch.as_tensor(torch.linalg.matmul(R1, torch.linalg.inv(R1).matmul(R2)) ** t).matmul(R1)
+                
+                # Handle potential numerical instability in rotation interpolation
+                try:
+                    R = torch.as_tensor(torch.linalg.matmul(R1, torch.linalg.inv(R1).matmul(R2)) ** t).matmul(R1)
+                except Exception as e:
+                    print(f"Rotation interpolation failed: {e}, using simple lerp")
+                    R = (1 - t) * R1 + t * R2
+                    # Normalize to ensure it's a valid rotation matrix
+                    U, _, V = torch.linalg.svd(R)
+                    R = U @ V.T
                 
                 # Linear interpolation for translation
                 T = (1 - t) * start_c2w[:3, 3] + t * end_c2w[:3, 3]
@@ -1414,7 +1457,7 @@ class SVCFly:
         # Convert to tensors
         target_c2ws = torch.stack(target_c2ws)
         target_Ks = torch.stack(target_Ks)
-                
+        
         # Setup rendering parameters
         all_c2ws = torch.cat([input_c2ws, target_c2ws], 0)
         all_Ks = torch.cat([input_Ks, target_Ks], 0) * input_Ks.new_tensor([W, H, 1])[:, None]
@@ -1578,6 +1621,36 @@ class SVCFly:
         
         # Return both the frames and the video path
         return (output_frames, video_path or "")
+        
+    def get_target_c2ws_and_Ks_from_preset(
+        self,
+        preprocessed: dict,
+        preset_traj: str,
+        num_frames: int,
+        zoom_factor: float,
+    ):
+        img_wh = preprocessed["input_wh"]
+        start_c2w = preprocessed["input_c2ws"][0]
+        start_w2c = torch.linalg.inv(start_c2w)
+        look_at = torch.tensor([0, 0, 10])
+        start_fov = DEFAULT_FOV_RAD
+        target_c2ws, target_fovs = get_preset_pose_fov(
+            preset_traj,
+            num_frames,
+            start_w2c,
+            look_at,
+            -start_c2w[:3, 1],
+            start_fov,
+            spiral_radii=[1.0, 1.0, 0.5],
+            zoom_factor=zoom_factor,
+        )
+        target_c2ws = torch.as_tensor(target_c2ws)
+        target_fovs = torch.as_tensor(target_fovs)
+        target_Ks = get_default_intrinsics(
+            target_fovs,
+            aspect_ratio=img_wh[0] / img_wh[1],
+        )
+        return target_c2ws, target_Ks
 
 # Register the node class for ComfyUI
 NODE_CLASS_MAPPINGS = {
